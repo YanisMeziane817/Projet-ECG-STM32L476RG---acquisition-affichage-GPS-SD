@@ -1,0 +1,9 @@
+../FATFS/Target/user_diskio.c:50:16:spi_tx_rx	32	static
+../FATFS/Target/user_diskio.c:57:13:spi_skip	16	static
+../FATFS/Target/user_diskio.c:62:16:wait_ready	16	static
+../FATFS/Target/user_diskio.c:71:16:send_cmd	24	static
+../FATFS/Target/user_diskio.c:127:9:USER_initialize	40	static
+../FATFS/Target/user_diskio.c:215:9:USER_status	16	static
+../FATFS/Target/user_diskio.c:233:9:USER_read	56	static
+../FATFS/Target/user_diskio.c:282:9:USER_write	32	static
+../FATFS/Target/user_diskio.c:336:9:USER_ioctl	56	static
