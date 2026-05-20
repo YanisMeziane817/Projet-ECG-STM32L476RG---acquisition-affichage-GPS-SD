@@ -25,12 +25,12 @@ Ce projet réalise un **électrocardiographe embarqué portatif** sur carte Nucl
 
 | Fonctionnalité | Détails |
 |---|---|
-| 📡 Acquisition ECG | 1000 Hz, résolution 12 bits, filtre moyenne glissante configurable |
+| 📡 Acquisition ECG | 1000 Hz, résolution 12 bits |
 | 🖥️ Affichage temps réel | Écran ILI9341 240×320 px, défilement continu, vert sur noir |
-| 💾 Sauvegarde SD | Fichiers CSV auto-nommés ECG_001 à ECG_999 (FatFS) |
-| 🛰️ Géolocalisation | GPS SparkFun Logger GPS-13750, parsing NMEA GPRMC |
+| 💾 Sauvegarde SD | Fichiers CSV auto-nommés (FatFS) |
+| 🛰️ Géolocalisation | GPS SparkFun Logger GPS |
 | 🔘 Contrôle | Bouton poussoir — déclenche un enregistrement de 500 échantillons |
-| 🐍 Analyse PC | Script Python — visualisation, détection pics R, calcul BPM |
+| 🐍 Analyse PC | Script Python — visualisation |
 
 ### Schéma général
 
@@ -41,8 +41,8 @@ Ce projet réalise un **électrocardiographe embarqué portatif** sur carte Nucl
 │  PC3  ◄────  AD8232 (amplificateur ECG)                  │
 │  PA5/6/7 ◄── SPI1 ──► Carte SD (FatFS)                  │
 │  PB6  ──────────────► CS carte SD                        │
-│  PA2/3 ◄──── USART2 ─► GPS SparkFun + HTerm (debug)     │
-│  8080 ──────────────► ILI9341 240×320                    │
+│  PA2/3 ◄──── USART2 ─► GPS SparkFun     │
+│  D0-D7 ──────────────► ILI9341 240×320                    │
 │  PA11 ◄─────────────  Bouton poussoir                    │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -54,10 +54,10 @@ Ce projet réalise un **électrocardiographe embarqué portatif** sur carte Nucl
 | Composant | Référence | Rôle |
 |---|---|---|
 | Microcontrôleur | STM32L476RG (Nucleo-L476RG) | MCU principal |
-| Amplificateur ECG | AD8232 (breakout SparkFun) | Acquisition signal cardiaque |
+| Amplificateur ECG | AD8232 | Acquisition et filtreage du signal cardiaque |
 | Écran couleur | ILI9341 2.8" 240×320 | Affichage temps réel |
-| Carte SD | Toute carte SD/microSD + adaptateur SPI | Stockage CSV |
-| Module GPS | SparkFun Logger GPS-13750 | Géolocalisation |
+| Carte SD | Toute carte SD/microSD | Stockage CSV |
+| Module GPS | SparkFun Logger GPS | Géolocalisation |
 | Bouton poussoir | Bouton momentané NO | Déclenchement enregistrement |
 | Câbles / breadboard | — | Connexions |
 | Électrodes ECG | Électrodes adhésives 3 fils | Captation signal cardiaque |
@@ -70,42 +70,58 @@ Ce projet réalise un **électrocardiographe embarqué portatif** sur carte Nucl
 
 ### AD8232 → STM32L476RG
 
-| Broche AD8232 | Broche STM32 | Fonction |
-|---|---|---|
-| OUTPUT | PC3 | Signal ECG analogique → ADC1_IN4 |
-| LO− | PC5 | Détection décrochage électrode − |
-| LO+ | PC6 | Détection décrochage électrode + |
-| SDN | PC8 | Shutdown ampli (actif bas) |
-| 3.3V | 3.3V | Alimentation |
-| GND | GND | Masse |
+| Signal CubeMX | Broche STM32 | Broche AD8232 | Fonction |
+|---|---|---|---|
+| Analog_input_PC3 | PC3 | OUTPUT | Signal ECG analogique → ADC1_IN4 |
+| — | PC5 | LO− | Détection décrochage électrode − |
+| GPIO_Input | PC6 | LO+ | Détection décrochage électrode + |
+| SDN | PC8 | SDN | Shutdown ampli (actif bas) |
+| — | 3.3V | 3.3V | Alimentation |
+| — | GND | GND | Masse |
 
 ### Carte SD → SPI1
 
-| Signal | Broche STM32 | Fonction |
+| Signal CubeMX | Broche STM32 | Fonction |
 |---|---|---|
-| SCK | PA5 | Horloge SPI |
-| MISO | PA6 | Données SD → MCU |
-| MOSI | PA7 | Données MCU → SD |
-| CS | PB6 | Chip Select (actif bas) |
-| 3.3V | 3.3V | Alimentation |
-| GND | GND | Masse |
+| SPI1_SCK | PA5 | Horloge SPI |
+| SPI1_MISO | PA6 | Données SD → MCU |
+| SPI1_MOSI | PA7 | Données MCU → SD |
+| SD_CS | PB6 | Chip Select (actif bas) |
+| — | 3.3V | Alimentation |
+| — | GND | Masse |
 
 ### GPS SparkFun → USART2
 
-| Signal | Broche STM32 | Fonction |
+| Signal CubeMX | Broche STM32 | Fonction |
 |---|---|---|
-| GPS TX | PA3 (RX MCU) | Trames NMEA → MCU |
-| MCU TX | PA2 (TX MCU) | Debug → HTerm PC |
-| 3.3V | 3.3V | Alimentation |
-| GND | GND | Masse |
+| USART_RX | PA3 | Trames NMEA GPS → MCU |
+| USART_TX | PA2 | Debug MCU → HTerm PC |
+| — | 3.3V | Alimentation |
+| — | GND | Masse |
 | Baudrate | — | 9600 bps |
 
-### Divers
+### Écran ILI9341 — Bus parallèle D0-D7
 
-| Élément | Broche STM32 | Config |
+| Signal CubeMX | Broche STM32 | Fonction |
 |---|---|---|
-| Bouton poussoir | PA11 | Pull-up interne, actif bas, EXTI |
-| Écran ILI9341 | Bus parallèle 8080 | Voir `ili9341_porsche.h` pour le mapping |
+| LCD_RD | PA0 | Read strobe |
+| LCD_WR | PA1 | Write strobe |
+| LCD_RST | PC1 | Reset écran |
+| LCD_CS | PB0 | Chip Select écran |
+| LCD_D0 | PA9 | Data bus bit 0 |
+| LCD_D1 | PC7 | Data bus bit 1 |
+| LCD_D2 | PA10 | Data bus bit 2 |
+| LCD_D3 | PB3 | Data bus bit 3 |
+| LCD_D4 | PB5 | Data bus bit 4 |
+| LCD_D5 | PB4 | Data bus bit 5 |
+| LCD_D6 | PB1 | Data bus bit 6 |
+| LCD_D7 | PA8 | Data bus bit 7 |
+
+### Bouton poussoir
+
+| Signal CubeMX | Broche STM32 | Config |
+|---|---|---|
+| Pousoir | PA11 | Pull-up interne, actif bas, EXTI |
 
 ---
 
@@ -153,31 +169,10 @@ Le GPS envoie des trames NMEA en continu à 9600 baud. La réception se fait car
 - Si c'est une trame `$GPRMC` avec fix valide (`A`), latitude et longitude sont mis à jour
 - La LED bleue du module GPS s'allume en fixe quand le fix est acquis (~1 min en extérieur)
 
-### Filtre moyenne glissante — `ecg_filter.c`
-
-```c
-// MA_SIZE défini dans ecg_filter.h (défaut : 10)
-uint16_t ecg_filter_ma(uint16_t new_sample) {
-    static uint16_t buf[MA_SIZE] = {0};
-    static uint8_t  idx = 0;
-    static uint32_t sum = 0;
-
-    sum -= buf[idx];
-    buf[idx] = new_sample;
-    sum += new_sample;
-    idx = (idx + 1) % MA_SIZE;
-
-    return (uint16_t)(sum / MA_SIZE);
-}
-```
-
-Lisse le bruit haute fréquence (50 Hz secteur, bruit de mouvement) sans déphaser les complexes QRS.
-
----
 
 ## Format des données CSV
 
-Chaque appui sur le bouton crée un nouveau fichier `ECG_NNN.CSV` (NNN de 001 à 999) sur la carte SD.
+Chaque appui sur le bouton crée un nouveau fichier sur la carte SD.
 
 ```
 index;raw;filtered;latitude;longitude
@@ -247,12 +242,13 @@ Toutes les bibliothèques sont incluses, aucun téléchargement supplémentaire 
 1. Assembler le circuit selon le brochage ci-dessus
 2. Insérer une carte SD formatée FAT32
 3. Brancher le Nucleo en USB → flasher le firmware
-4. L'écran s'allume : le signal ECG défile en vert en temps réel
-5. Placer les 3 électrodes ECG (RA bras droit, LA bras gauche, RL jambe droite)
-6. Aller en extérieur et attendre le fix GPS : la LED bleue du module devient fixe (~1 min)
-7. Appuyer sur le bouton → 500 échantillons sont enregistrés dans `ECG_001.CSV`
-8. Chaque appui suivant crée `ECG_002.CSV`, `ECG_003.CSV`, etc.
-9. Retirer la SD et analyser sur PC avec le script Python
+4. Placer les 3 électrodes ECG (RA bras droit, LA bras gauche, RL jambe droite)
+5. Appuyer sur le bouton poussoir
+6. L'écran s'allume : le signal ECG défile en vert en temps réel
+7. Aller en extérieur et attendre le fix GPS : la LED bleue du module devient fixe (~1 min)
+8. Appuyer sur le bouton → 500 échantillons sont enregistrés dans `ECG_001.CSV`
+9. Chaque appui suivant crée `ECG_002.CSV`, `ECG_003.CSV`, etc.
+10. Retirer la SD et analyser sur PC avec le script Python
 
 ---
 
@@ -346,9 +342,9 @@ Projet-ECG/
 
 **Yanis Meziane** — [@YanisMeziane817](https://github.com/YanisMeziane817)
 
-**Evan Legd** — [@EvanLegd](https://github.com/EvanLegd)
+**Evan Legland** — [@EvanLegd](https://github.com/EvanLegd)
 
-Projet réalisé dans le cadre d'un cours de systèmes embarqués.
+Projet réalisé dans le cadre de la fin de seconde année d'école d'ingénieur (ENSISA).
 
 ---
 
