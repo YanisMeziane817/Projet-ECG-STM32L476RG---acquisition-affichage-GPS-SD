@@ -1,4 +1,4 @@
-# 🫀 Cardiographe Embarqué Portatif — STM32L476RG
+# Cardiographe Embarqué Portatif — STM32L476RG
 
 > Acquisition ECG temps réel, affichage sur écran couleur, sauvegarde CSV sur carte SD avec géolocalisation GPS.
 
