@@ -346,6 +346,8 @@ Projet-ECG/
 
 **Yanis Meziane** — [@YanisMeziane817](https://github.com/YanisMeziane817)
 
+**Evan Legd** — [@EvanLegd](https://github.com/EvanLegd)
+
 Projet réalisé dans le cadre d'un cours de systèmes embarqués.
 
 ---
