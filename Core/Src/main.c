@@ -1,16 +1,11 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    main.c  — VERSION FINALE v4
-  *
-  *  CORRECTIONS v4 :
-  *   1. USART2 remis à 115200 (avait été remis à 9600 par erreur)
-  *   2. CSV : lat/lon écrits UNE SEULE FOIS dans le header du fichier
-  *            → format : index;raw;filtered  (500 lignes légères)
-  *            → ligne 1 du header contient LAT et LON
-  *   3. SD : CS forcé HIGH avant et après chaque accès SPI ILI9341
-  *            pour éviter collision sur le bus SPI partagé
-  *   4. disk_initialize() remplacé par séquence correcte FatFS
+  * @file    main.c  — VERSION v13
+  *  Base : v12
+  *  Ajouts :
+  *   1. Parser GPRMC pour récupérer la DATE (DDMMYY) en plus de GPGGA
+  *   2. Nom fichier : ECG_HH_DD_MM_YYYY.CSV  ex: ECG_18_22_05_2026.CSV
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -59,7 +54,13 @@ static uint16_t csv_pos = 0;
 /* ─── GPS ─────────────────────────────────────────────────────────────────── */
 static float   gps_latitude  = 0.0f;
 static float   gps_longitude = 0.0f;
-static uint8_t gps_valid     = 0;
+static float   gps_altitude  = 0.0f;
+static char    gps_hh[3]     = "00";   /* heure   HH         */
+static char    gps_dd[3]     = "00";   /* jour    DD         */
+static char    gps_mm[3]     = "00";   /* mois    MM         */
+static char    gps_yyyy[5]   = "2000"; /* année   YYYY       */
+static uint8_t gps_valid     = 0;      /* fix GPGGA OK       */
+static uint8_t gps_date_valid = 0;     /* date GPRMC OK      */
 
 /* ─── Affichage ───────────────────────────────────────────────────────────── */
 static uint16_t pos          = 319;
@@ -106,15 +107,7 @@ static uint16_t ma_filter(uint16_t raw)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  CSV — GPS écrit UNE SEULE FOIS dans le header
- *
- *  Format du fichier :
- *    latitude;longitude
- *    47.729134;7.309942
- *    index;raw;filtered
- *    0;2048;2047
- *    1;2050;2049
- *    ...
+ *  CSV
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void csv_flush(void)
 {
@@ -129,7 +122,6 @@ static void csv_write_sample(uint32_t idx, uint16_t raw, uint16_t filt)
     char line[32];
     int  len = snprintf(line, sizeof(line), "%lu;%u;%u\r\n",
                         (unsigned long)idx, raw, filt);
-
     if (csv_pos + (uint16_t)len >= CSV_BUF_SIZE) csv_flush();
     memcpy(&csv_buf[csv_pos], line, (size_t)len);
     csv_pos += (uint16_t)len;
@@ -137,6 +129,8 @@ static void csv_write_sample(uint32_t idx, uint16_t raw, uint16_t filt)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  GPS — parser GPGGA
+ *  Récupère : latitude, longitude, altitude, heure HH
+ *  Champs : [1]=HHMMSS [2]=lat [3]=N/S [4]=lon [5]=E/W [6]=qualité [9]=alt
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void gps_parse_gpgga(const char *line)
 {
@@ -156,28 +150,77 @@ static void gps_parse_gpgga(const char *line)
         while (*p && *p != ',') p++;
         if (*p == ',') { *p = '\0'; p++; }
     }
-    if (nf < 7) return;
+    if (nf < 10) return;
+    if (fields[6][0] == '0' || fields[6][0] == '\0') { gps_valid = 0; return; }
 
-    if (fields[6][0] == '0' || fields[6][0] == '\0') {
-        gps_valid = 0;
-        return;
-    }
+    /* Heure HH [1] : "HHMMSS.ss" → garder seulement HH */
+    gps_hh[0] = fields[1][0];
+    gps_hh[1] = fields[1][1];
+    gps_hh[2] = '\0';
 
+    /* Latitude */
     float lat_raw = atof(fields[2]);
     int   lat_deg = (int)(lat_raw / 100);
     gps_latitude  = lat_deg + (lat_raw - lat_deg * 100) / 60.0f;
     if (fields[3][0] == 'S') gps_latitude = -gps_latitude;
 
+    /* Longitude */
     float lon_raw = atof(fields[4]);
     int   lon_deg = (int)(lon_raw / 100);
     gps_longitude = lon_deg + (lon_raw - lon_deg * 100) / 60.0f;
     if (fields[5][0] == 'W') gps_longitude = -gps_longitude;
 
+    /* Altitude */
+    gps_altitude = atof(fields[9]);
+
     gps_valid = 1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  GPS — parser GPRMC
+ *  Récupère : date DD MM YYYY
+ *  Trame : $GPRMC,HHMMSS,A,lat,N,lon,E,vitesse,cap,DDMMYY,,,*xx
+ *  Champs :   [1]       [2][3][4][5][6][7]     [8] [9]
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void gps_parse_gprmc(const char *line)
+{
+    const char *start = strstr(line, "$GPRMC");
+    if (start == NULL) start = strstr(line, "$GNRMC");
+    if (start == NULL) return;
+
+    char buf[GPS_LINE_SIZE];
+    strncpy(buf, start, GPS_LINE_SIZE - 1);
+    buf[GPS_LINE_SIZE - 1] = '\0';
+
+    char   *fields[12];
+    uint8_t nf = 0;
+    char   *p  = buf;
+    while (*p && nf < 12) {
+        fields[nf++] = p;
+        while (*p && *p != ',') p++;
+        if (*p == ',') { *p = '\0'; p++; }
+    }
+    if (nf < 10) return;
+
+    /* Statut [2] : 'A' = valide, 'V' = invalide */
+    if (fields[2][0] != 'A') return;
+
+    /* Date [9] : "DDMMYY" → DD, MM, 20YY */
+    if (strlen(fields[9]) < 6) return;
+
+    gps_dd[0] = fields[9][0]; gps_dd[1] = fields[9][1]; gps_dd[2] = '\0';
+    gps_mm[0] = fields[9][2]; gps_mm[1] = fields[9][3]; gps_mm[2] = '\0';
+    /* Année : "YY" → "20YY" */
+    gps_yyyy[0] = '2'; gps_yyyy[1] = '0';
+    gps_yyyy[2] = fields[9][4]; gps_yyyy[3] = fields[9][5];
+    gps_yyyy[4] = '\0';
+
+    gps_date_valid = 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  GPS — lecture bloquante
+ *  Attend GPGGA (position+altitude) ET GPRMC (date)
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void gps_read_blocking(void)
 {
@@ -187,7 +230,8 @@ static void gps_read_blocking(void)
     uint8_t  last_was_cr = 0;
     uint32_t timeout     = HAL_GetTick();
 
-    gps_valid = 0;
+    gps_valid      = 0;
+    gps_date_valid = 0;
     LOG("GPS: attente trame...\r\n");
 
     while ((HAL_GetTick() - timeout) < 5000UL)
@@ -197,18 +241,18 @@ static void gps_read_blocking(void)
         if (byte == '\r')
         {
             last_was_cr = 1;
-            if (idx > 0)
-            {
-                buf[idx] = '\0';
-                idx = 0;
+            if (idx > 0) {
+                buf[idx] = '\0'; idx = 0;
                 gps_parse_gpgga(buf);
-                if (gps_valid)
-                {
-                    char msg[64];
-                    int  len = snprintf(msg, sizeof(msg),
-                                        "GPS OK: LAT=%.6f LON=%.6f\r\n",
-                                        (double)gps_latitude,
-                                        (double)gps_longitude);
+                gps_parse_gprmc(buf);
+
+                if (gps_valid && gps_date_valid) {
+                    char msg[96];
+                    int len = snprintf(msg, sizeof(msg),
+                        "GPS OK: %sh%s %s/%s/%s LAT=%.6f LON=%.6f ALT=%.1fm\r\n",
+                        gps_hh, "UTC", gps_dd, gps_mm, gps_yyyy,
+                        (double)gps_latitude, (double)gps_longitude,
+                        (double)gps_altitude);
                     HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)len, 200);
                     return;
                 }
@@ -218,18 +262,18 @@ static void gps_read_blocking(void)
         {
             if (last_was_cr) { last_was_cr = 0; continue; }
             last_was_cr = 0;
-            if (idx > 0)
-            {
-                buf[idx] = '\0';
-                idx = 0;
+            if (idx > 0) {
+                buf[idx] = '\0'; idx = 0;
                 gps_parse_gpgga(buf);
-                if (gps_valid)
-                {
-                    char msg[64];
-                    int  len = snprintf(msg, sizeof(msg),
-                                        "GPS OK: LAT=%.6f LON=%.6f\r\n",
-                                        (double)gps_latitude,
-                                        (double)gps_longitude);
+                gps_parse_gprmc(buf);
+
+                if (gps_valid && gps_date_valid) {
+                    char msg[96];
+                    int len = snprintf(msg, sizeof(msg),
+                        "GPS OK: %sh%s %s/%s/%s LAT=%.6f LON=%.6f ALT=%.1fm\r\n",
+                        gps_hh, "UTC", gps_dd, gps_mm, gps_yyyy,
+                        (double)gps_latitude, (double)gps_longitude,
+                        (double)gps_altitude);
                     HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)len, 200);
                     return;
                 }
@@ -238,13 +282,10 @@ static void gps_read_blocking(void)
         else
         {
             last_was_cr = 0;
-            if (idx < GPS_LINE_SIZE - 1)
-                buf[idx++] = (char)byte;
-            else
-                idx = 0;
+            if (idx < GPS_LINE_SIZE - 1) buf[idx++] = (char)byte;
+            else idx = 0;
         }
     }
-
     LOG("GPS timeout - pas de fix\r\n");
 }
 
@@ -257,7 +298,6 @@ int main(void)
     SystemClock_Config();
     MX_GPIO_Init();
 
-    /* SD CS inactif dès le départ — CRITIQUE pour SPI partagé */
     SD_CS_HIGH();
 
     MX_USART2_UART_Init();
@@ -274,18 +314,15 @@ int main(void)
     MX_TIM2_Init();
     MX_ADC1_Init();
 
-    /* SD CS encore une fois après init SPI */
     SD_CS_HIGH();
     HAL_Delay(10);
 
     ILI9341_Init();
     ILI9341_ClearScreen(ILI9341_BLACK);
 
-    /* SD CS après init LCD — le LCD a pu tripoter le bus SPI */
     SD_CS_HIGH();
 
     AD8232_SLEEP();
-
     LOG("En attente bouton...\r\n");
 
     /* ═══ Boucle principale ══════════════════════════════════════════════ */
@@ -301,25 +338,20 @@ int main(void)
         AD8232_WAKE();
         HAL_Delay(5);
         ILI9341_ClearScreen(ILI9341_BLACK);
-
-        /* CS SD bien haut après que le LCD a fini */
         SD_CS_HIGH();
         HAL_Delay(5);
 
         /* ── 1. GPS ──────────────────────────────────────────────────── */
         gps_read_blocking();
 
-        /* ── 2. SD : montage + ouverture fichier ─────────────────────── */
+        /* ── 2. SD ───────────────────────────────────────────────────── */
         uint8_t file_open = 0;
 
-        /* Séquence d'init SD propre */
         f_mount(NULL, "", 0);
         HAL_Delay(20);
-
         FRESULT fm = f_mount(&fs, "", 1);
 
-        if (fm == FR_NO_FILESYSTEM)
-        {
+        if (fm == FR_NO_FILESYSTEM) {
             LOG("SD: formatage FAT32...\r\n");
             BYTE work[512];
             fm = f_mkfs("", FM_FAT32, 0, work, sizeof(work));
@@ -331,47 +363,48 @@ int main(void)
 
         if (fm == FR_OK)
         {
-            char    fname[16];
-            FILINFO fno;
-            UINT    bw;
+            char fname[32];
+            UINT bw;
 
-            for (uint16_t n = 1; n <= 999; n++) {
-                snprintf(fname, sizeof(fname), "ECG_%03u.CSV", (unsigned)n);
-                if (f_stat(fname, &fno) == FR_NO_FILE) break;
+            /* Nom fichier : ECG_HH_DD_MM_YYYY.CSV si GPS + date valides
+               sinon fallback numéroté ECG_001.CSV                      */
+            if (gps_valid && gps_date_valid) {
+                snprintf(fname, sizeof(fname), "ECG_%s_%s_%s_%s.CSV",
+                         gps_hh, gps_dd, gps_mm, gps_yyyy);
+            } else {
+                FILINFO fno;
+                for (uint16_t n = 1; n <= 999; n++) {
+                    snprintf(fname, sizeof(fname), "ECG_%03u.CSV", (unsigned)n);
+                    if (f_stat(fname, &fno) == FR_NO_FILE) break;
+                }
             }
 
-            if (f_open(&csv_file, fname, FA_CREATE_NEW | FA_WRITE) == FR_OK)
+            if (f_open(&csv_file, fname, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
             {
-                /*
-                 * Header ligne 1 : GPS (une seule fois pour tout le fichier)
-                 * Header ligne 2 : noms de colonnes
-                 */
-                char hdr[128];
+                char hdr[160];
                 int  hlen;
                 if (gps_valid)
                     hlen = snprintf(hdr, sizeof(hdr),
-                                    "latitude;longitude\r\n"
-                                    "%.6f;%.6f\r\n"
+                                    "heure_utc;latitude;longitude;altitude_m\r\n"
+                                    "%sh UTC %s/%s/%s;%.6f;%.6f;%.1f\r\n"
                                     "index;raw;filtered\r\n",
+                                    gps_hh, gps_dd, gps_mm, gps_yyyy,
                                     (double)gps_latitude,
-                                    (double)gps_longitude);
+                                    (double)gps_longitude,
+                                    (double)gps_altitude);
                 else
                     hlen = snprintf(hdr, sizeof(hdr),
-                                    "latitude;longitude\r\n"
-                                    "0.000000;0.000000\r\n"
+                                    "heure_utc;latitude;longitude;altitude_m\r\n"
+                                    "N/A;0.000000;0.000000;0.0\r\n"
                                     "index;raw;filtered\r\n");
 
-                if (f_write(&csv_file, hdr, (UINT)hlen, &bw) == FR_OK && bw == (UINT)hlen)
-                {
+                if (f_write(&csv_file, hdr, (UINT)hlen, &bw) == FR_OK && bw == (UINT)hlen) {
                     file_open = 1;
                     LOG("SD OK: "); LOG(fname); LOG("\r\n");
-                }
-                else { f_close(&csv_file); LOG("SD ERR write hdr\r\n"); }
-            }
-            else { LOG("SD ERR open\r\n"); }
+                } else { f_close(&csv_file); LOG("SD ERR write hdr\r\n"); }
+            } else { LOG("SD ERR open\r\n"); }
         }
-        else
-        {
+        else {
             char errmsg[32];
             snprintf(errmsg, sizeof(errmsg), "SD ERR mount code=%d\r\n", (int)fm);
             LOG(errmsg);
@@ -397,18 +430,8 @@ int main(void)
             uint8_t process = 0;
             int     offset  = 0;
 
-            if (dma_half_flag)
-            {
-                dma_half_flag = 0;
-                process = 1;
-                offset  = 0;
-            }
-            else if (dma_complete_flag)
-            {
-                dma_complete_flag = 0;
-                process = 1;
-                offset  = BUFFER_SIZE / 2;
-            }
+            if (dma_half_flag)          { dma_half_flag = 0;     process = 1; offset = 0; }
+            else if (dma_complete_flag) { dma_complete_flag = 0; process = 1; offset = BUFFER_SIZE / 2; }
 
             if (!process) continue;
 
@@ -424,11 +447,10 @@ int main(void)
                 uint16_t filtered = ma_filter(raw);
                 if (leads_off) filtered = ADC_BASELINE;
 
-                /* CSV : juste index;raw;filtered — GPS déjà dans le header */
                 if (file_open) csv_write_sample(sample_count, raw, filtered);
                 sample_count++;
 
-                /* Affichage oscilloscope */
+                /* Oscilloscope */
                 int32_t c     = (int32_t)filtered - ADC_BASELINE;
                 int16_t cur_x = 120 - (int16_t)(c / GAIN);
                 if (cur_x <   5) cur_x =   5;
@@ -464,20 +486,15 @@ int main(void)
             LOG("Fichier ferme OK\r\n");
         }
 
-        {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "Acquisition OK: %lu echantillons\r\n",
-                     (unsigned long)sample_count);
-            LOG(msg);
-        }
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Acquisition OK: %lu echantillons\r\n",
+                 (unsigned long)sample_count);
+        LOG(msg);
 
         AD8232_SLEEP();
-
-        /* CS SD haut avant de toucher au LCD */
         SD_CS_HIGH();
         ILI9341_ClearScreen(ILI9341_BLACK);
         SD_CS_HIGH();
-
         LOG("En attente bouton...\r\n");
     }
 }
@@ -507,7 +524,7 @@ static void MX_SPI1_Init(void)
     hspi1.Init.CLKPolarity       = SPI_POLARITY_LOW;
     hspi1.Init.CLKPhase          = SPI_PHASE_1EDGE;
     hspi1.Init.NSS               = SPI_NSS_SOFT;
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;  /* 80/8 = 10 MHz SD */
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
     hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
     hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
     hspi1.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
@@ -575,7 +592,7 @@ static void MX_DMA_Init(void)
 static void MX_USART2_UART_Init(void)
 {
     huart2.Instance          = USART2;
-    huart2.Init.BaudRate     = 115200;   /* ← 115200, pas 9600 */
+    huart2.Init.BaudRate     = 115200;
     huart2.Init.WordLength   = UART_WORDLENGTH_8B;
     huart2.Init.StopBits     = UART_STOPBITS_1;
     huart2.Init.Parity       = UART_PARITY_NONE;
@@ -607,7 +624,6 @@ static void MX_GPIO_Init(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* SD CS HIGH en premier — avant tout init SPI */
     HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
 
     HAL_GPIO_WritePin(GPIOC, LCD_RST_Pin | LCD_D1_Pin | SDN_Pin, GPIO_PIN_RESET);
@@ -657,7 +673,6 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(SD_CS_GPIO_Port, &GPIO_InitStruct);
 
-    /* Remettre SD CS HIGH après init GPIO (init remet à 0) */
     HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
 }
 
