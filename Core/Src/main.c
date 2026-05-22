@@ -1,21 +1,16 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    main.c  — CORRIGE
-  * @brief   ECG AD8232 + GPS USART3 + debug USART2
+  * @file    main.c  — VERSION FINALE v4
   *
-  * CORRECTIONS APPORTEES :
-  *  1. USART2 BaudRate corrigé à 115200 (était 9600 dans CubeMX → incohérence)
-  *  2. HAL_ADC_ConvHalfCpltCallback ajouté (DMA circulaire → callback jamais déclenché)
-  *  3. dma_complete_flag déclaré volatile + accès atomique protégé
-  *  4. GPS : gps_read_blocking déplacé AVANT le montage SD pour éviter
-  *     que la boucle ADC se déclenche trop tôt
-  *  5. SD : f_mount corrigé (unmount propre avant remontage)
-  *  6. ADC_CHANNEL_4 → PC3 = IN4 ✓ (confirmé)
-  *  7. Vérification leads_off corrigée (PC5=LO-, PC6=LO+)
-  *  8. LOG() macro robustifiée avec timeout augmenté
-  *  9. Ajout debug UART2 dans gps_read_blocking pour chaque trame reçue
-  * 10. Reset complet du flag DMA avant chaque acquisition
+  *  CORRECTIONS v4 :
+  *   1. USART2 remis à 115200 (avait été remis à 9600 par erreur)
+  *   2. CSV : lat/lon écrits UNE SEULE FOIS dans le header du fichier
+  *            → format : index;raw;filtered  (500 lignes légères)
+  *            → ligne 1 du header contient LAT et LON
+  *   3. SD : CS forcé HIGH avant et après chaque accès SPI ILI9341
+  *            pour éviter collision sur le bus SPI partagé
+  *   4. disk_initialize() remplacé par séquence correcte FatFS
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -28,68 +23,59 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* ─── Handles ──────────────────────────────────────────────────────────────── */
+/* ─── Handles ─────────────────────────────────────────────────────────────── */
 ADC_HandleTypeDef  hadc1;
 DMA_HandleTypeDef  hdma_adc1;
 TIM_HandleTypeDef  htim2;
 SPI_HandleTypeDef  hspi1;
-UART_HandleTypeDef huart2;   /* DEBUG PA2=TX → ST-Link → HTerm 115200 baud */
-UART_HandleTypeDef huart3;   /* GPS  PB11=RX ← GPS TX  9600 baud           */
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
 
-/* ─── Constantes ────────────────────────────────────────────────────────────── */
+/* ─── Constantes ──────────────────────────────────────────────────────────── */
 #define BUFFER_SIZE    20
 #define ADC_BASELINE   2000
 #define GAIN           5
 #define TOTAL_SAMPLES  500u
 #define MA_SIZE        4
-#define CSV_BUF_SIZE   256
+#define CSV_BUF_SIZE   512
 #define GPS_LINE_SIZE  128
 
-/* ─── Buffers ADC / DMA ─────────────────────────────────────────────────────── */
+/* ─── Buffers ADC/DMA ─────────────────────────────────────────────────────── */
 uint16_t         adc_buffer[BUFFER_SIZE];
+volatile uint8_t dma_half_flag     = 0;
+volatile uint8_t dma_complete_flag = 0;
 
-/*
- * CORRECTION 1 : volatile + __IO pour garantir la visibilité depuis le callback IRQ.
- * Avec DMA circulaire, ConvCpltCallback se déclenche en fin de buffer COMPLET
- * et ConvHalfCpltCallback en fin du DEMI-buffer → les deux sont maintenant gérés.
- */
-volatile uint8_t dma_half_flag     = 0;   /* nouveau : half-complete   */
-volatile uint8_t dma_complete_flag = 0;   /* existant : full-complete  */
-
-/* ─── Filtre moyenne mobile ─────────────────────────────────────────────────── */
+/* ─── Filtre MA ───────────────────────────────────────────────────────────── */
 static uint16_t ma_buf[MA_SIZE];
 static uint8_t  ma_idx = 0;
 static uint32_t ma_sum = 0;
 
-/* ─── SD / FatFS ─────────────────────────────────────────────────────────────── */
+/* ─── SD / FatFS ──────────────────────────────────────────────────────────── */
 static FATFS    fs;
 static FIL      csv_file;
 static char     csv_buf[CSV_BUF_SIZE];
 static uint16_t csv_pos = 0;
 
-/* ─── GPS ────────────────────────────────────────────────────────────────────── */
-static float    gps_latitude  = 0.0f;
-static float    gps_longitude = 0.0f;
-static uint8_t  gps_valid     = 0;
+/* ─── GPS ─────────────────────────────────────────────────────────────────── */
+static float   gps_latitude  = 0.0f;
+static float   gps_longitude = 0.0f;
+static uint8_t gps_valid     = 0;
 
-/* ─── Affichage ─────────────────────────────────────────────────────────────── */
+/* ─── Affichage ───────────────────────────────────────────────────────────── */
 static uint16_t pos          = 319;
 static uint16_t last_x       = 120;
 static uint8_t  first_pt     = 1;
 static uint32_t sample_count = 0;
 
-/* ─── Macros ─────────────────────────────────────────────────────────────────── */
-#define AD8232_WAKE()  HAL_GPIO_WritePin(SDN_GPIO_Port,    SDN_Pin,    GPIO_PIN_SET)
-#define AD8232_SLEEP() HAL_GPIO_WritePin(SDN_GPIO_Port,    SDN_Pin,    GPIO_PIN_RESET)
-#define BTN_PRESSED()  (HAL_GPIO_ReadPin(Pousoir_GPIO_Port, Pousoir_Pin) == GPIO_PIN_RESET)
+/* ─── Macros ──────────────────────────────────────────────────────────────── */
+#define AD8232_WAKE()   HAL_GPIO_WritePin(SDN_GPIO_Port,     SDN_Pin,    GPIO_PIN_SET)
+#define AD8232_SLEEP()  HAL_GPIO_WritePin(SDN_GPIO_Port,     SDN_Pin,    GPIO_PIN_RESET)
+#define BTN_PRESSED()   (HAL_GPIO_ReadPin(Pousoir_GPIO_Port, Pousoir_Pin) == GPIO_PIN_RESET)
+#define SD_CS_HIGH()    HAL_GPIO_WritePin(SD_CS_GPIO_Port,   SD_CS_Pin,  GPIO_PIN_SET)
+#define SD_CS_LOW()     HAL_GPIO_WritePin(SD_CS_GPIO_Port,   SD_CS_Pin,  GPIO_PIN_RESET)
+#define LOG(msg)        HAL_UART_Transmit(&huart2, (uint8_t*)(msg), strlen(msg), 200)
 
-/*
- * CORRECTION 2 : LOG() — timeout augmenté à 200 ms pour 115200 baud,
- * évite les troncatures sur les longues chaînes.
- */
-#define LOG(msg)       HAL_UART_Transmit(&huart2, (uint8_t*)(msg), strlen(msg), 200)
-
-/* ─── Prototypes ─────────────────────────────────────────────────────────────── */
+/* ─── Prototypes ──────────────────────────────────────────────────────────── */
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
@@ -100,9 +86,9 @@ static void MX_TIM2_Init(void);
 static void MX_ADC1_Init(void);
 static void gps_read_blocking(void);
 
-/* ═══════════════════════════════════════════════════════════════════════════════
- *  Filtre MA
- * ═══════════════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Filtre moyenne mobile
+ * ═══════════════════════════════════════════════════════════════════════════ */
 static void ma_init(uint16_t baseline)
 {
     for (int i = 0; i < MA_SIZE; i++) ma_buf[i] = baseline;
@@ -119,9 +105,17 @@ static uint16_t ma_filter(uint16_t raw)
     return (uint16_t)(ma_sum / MA_SIZE);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════════
- *  CSV
- * ═══════════════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  CSV — GPS écrit UNE SEULE FOIS dans le header
+ *
+ *  Format du fichier :
+ *    latitude;longitude
+ *    47.729134;7.309942
+ *    index;raw;filtered
+ *    0;2048;2047
+ *    1;2050;2049
+ *    ...
+ * ═══════════════════════════════════════════════════════════════════════════ */
 static void csv_flush(void)
 {
     if (csv_pos == 0) return;
@@ -130,38 +124,33 @@ static void csv_flush(void)
     csv_pos = 0;
 }
 
-static void csv_write_gps(uint32_t idx, uint16_t raw, uint16_t filt)
+static void csv_write_sample(uint32_t idx, uint16_t raw, uint16_t filt)
 {
-    char line[80];
-    int len;
-    if (gps_valid)
-        len = snprintf(line, sizeof(line), "%lu;%u;%u;%.6f;%.6f\r\n",
-                       (unsigned long)idx, raw, filt,
-                       (double)gps_latitude, (double)gps_longitude);
-    else
-        len = snprintf(line, sizeof(line), "%lu;%u;%u;0.000000;0.000000\r\n",
-                       (unsigned long)idx, raw, filt);
+    char line[32];
+    int  len = snprintf(line, sizeof(line), "%lu;%u;%u\r\n",
+                        (unsigned long)idx, raw, filt);
 
     if (csv_pos + (uint16_t)len >= CSV_BUF_SIZE) csv_flush();
     memcpy(&csv_buf[csv_pos], line, (size_t)len);
     csv_pos += (uint16_t)len;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════════
- *  GPS
- * ═══════════════════════════════════════════════════════════════════════════════ */
-static void gps_parse_gprmc(const char *line)
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  GPS — parser GPGGA
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void gps_parse_gpgga(const char *line)
 {
-    if (strncmp(line, "$GPRMC", 6) != 0 && strncmp(line, "$GNRMC", 6) != 0) return;
+    const char *start = strstr(line, "$GPGGA");
+    if (start == NULL) start = strstr(line, "$GNGGA");
+    if (start == NULL) return;
 
     char buf[GPS_LINE_SIZE];
-    strncpy(buf, line, GPS_LINE_SIZE - 1);
+    strncpy(buf, start, GPS_LINE_SIZE - 1);
     buf[GPS_LINE_SIZE - 1] = '\0';
 
     char   *fields[12];
     uint8_t nf = 0;
     char   *p  = buf;
-
     while (*p && nf < 12) {
         fields[nf++] = p;
         while (*p && *p != ',') p++;
@@ -169,174 +158,174 @@ static void gps_parse_gprmc(const char *line)
     }
     if (nf < 7) return;
 
-    /* Statut 'A' = fix valide */
-    if (fields[2][0] != 'A') { gps_valid = 0; return; }
+    if (fields[6][0] == '0' || fields[6][0] == '\0') {
+        gps_valid = 0;
+        return;
+    }
 
-    float lat_raw = atof(fields[3]);
+    float lat_raw = atof(fields[2]);
     int   lat_deg = (int)(lat_raw / 100);
     gps_latitude  = lat_deg + (lat_raw - lat_deg * 100) / 60.0f;
-    if (fields[4][0] == 'S') gps_latitude = -gps_latitude;
+    if (fields[3][0] == 'S') gps_latitude = -gps_latitude;
 
-    float lon_raw = atof(fields[5]);
+    float lon_raw = atof(fields[4]);
     int   lon_deg = (int)(lon_raw / 100);
     gps_longitude = lon_deg + (lon_raw - lon_deg * 100) / 60.0f;
-    if (fields[6][0] == 'W') gps_longitude = -gps_longitude;
+    if (fields[5][0] == 'W') gps_longitude = -gps_longitude;
 
     gps_valid = 1;
 }
 
-/*
- * CORRECTION 3 : gps_read_blocking
- *   — Chaque octet reçu est visible sur HTerm via echo USART2
- *   — Timeout porté à 5 s (GPS froid peut être lent)
- *   — Retourne dès que gps_valid==1 OU timeout
- */
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  GPS — lecture bloquante
+ * ═══════════════════════════════════════════════════════════════════════════ */
 static void gps_read_blocking(void)
 {
-    char    buf[GPS_LINE_SIZE];
-    uint8_t byte;
-    uint16_t idx     = 0;
-    uint32_t timeout = HAL_GetTick();
+    char     buf[GPS_LINE_SIZE];
+    uint8_t  byte;
+    uint16_t idx         = 0;
+    uint8_t  last_was_cr = 0;
+    uint32_t timeout     = HAL_GetTick();
 
     gps_valid = 0;
     LOG("GPS: attente trame...\r\n");
 
     while ((HAL_GetTick() - timeout) < 5000UL)
     {
-        if (HAL_UART_Receive(&huart3, &byte, 1, 10) == HAL_OK)
+        if (HAL_UART_Receive(&huart3, &byte, 1, 10) != HAL_OK) continue;
+
+        if (byte == '\r')
         {
-            /* Echo octet par octet — utile pour vérifier que USART3 reçoit */
-            HAL_UART_Transmit(&huart2, &byte, 1, 5);
-
-            if (byte == '\n' || byte == '\r')
+            last_was_cr = 1;
+            if (idx > 0)
             {
-                if (idx > 0)
+                buf[idx] = '\0';
+                idx = 0;
+                gps_parse_gpgga(buf);
+                if (gps_valid)
                 {
-                    buf[idx] = '\0';
-
-                    /* Afficher la trame complète */
-                    LOG("\r\nTRAME: ");
-                    LOG(buf);
-                    LOG("\r\n");
-
-                    gps_parse_gprmc(buf);
-
-                    if (gps_valid)
-                    {
-                        char msg[80];
-                        int  len = snprintf(msg, sizeof(msg),
-                                            "GPS OK: LAT=%.6f LON=%.6f\r\n",
-                                            (double)gps_latitude,
-                                            (double)gps_longitude);
-                        HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)len, 200);
-                        return;   /* fix obtenu → on sort */
-                    }
-                    idx = 0;
+                    char msg[64];
+                    int  len = snprintf(msg, sizeof(msg),
+                                        "GPS OK: LAT=%.6f LON=%.6f\r\n",
+                                        (double)gps_latitude,
+                                        (double)gps_longitude);
+                    HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)len, 200);
+                    return;
                 }
             }
-            else if (idx < GPS_LINE_SIZE - 1)
+        }
+        else if (byte == '\n')
+        {
+            if (last_was_cr) { last_was_cr = 0; continue; }
+            last_was_cr = 0;
+            if (idx > 0)
             {
-                buf[idx++] = (char)byte;
-            }
-            else
-            {
-                /* Débordement de ligne → réinitialiser */
+                buf[idx] = '\0';
                 idx = 0;
+                gps_parse_gpgga(buf);
+                if (gps_valid)
+                {
+                    char msg[64];
+                    int  len = snprintf(msg, sizeof(msg),
+                                        "GPS OK: LAT=%.6f LON=%.6f\r\n",
+                                        (double)gps_latitude,
+                                        (double)gps_longitude);
+                    HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)len, 200);
+                    return;
+                }
             }
         }
+        else
+        {
+            last_was_cr = 0;
+            if (idx < GPS_LINE_SIZE - 1)
+                buf[idx++] = (char)byte;
+            else
+                idx = 0;
+        }
     }
-    LOG("\r\nGPS timeout - pas de fix, lat/lon = 0\r\n");
+
+    LOG("GPS timeout - pas de fix\r\n");
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════════════════
  *  main
- * ═══════════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════ */
 int main(void)
 {
     HAL_Init();
     SystemClock_Config();
     MX_GPIO_Init();
 
-    /* ── USART2 debug ─────────────────────────────────────────────────────── */
+    /* SD CS inactif dès le départ — CRITIQUE pour SPI partagé */
+    SD_CS_HIGH();
+
     MX_USART2_UART_Init();
-    HAL_Delay(10);                          /* laisse le transceiver ST-Link se stabiliser */
+    HAL_Delay(10);
     LOG("\r\n\r\n=== BOOT OK ===\r\n");
-    LOG("SYSCLK 80 MHz, USART2 115200 8N1\r\n");
+    LOG("SYSCLK 80MHz | USART2 115200 8N1\r\n");
 
-    /* ── USART3 GPS ───────────────────────────────────────────────────────── */
     MX_USART3_UART_Init();
-    LOG("USART3 GPS OK (PB11=RX, 9600)\r\n");
+    LOG("USART3 GPS OK (PB11=RX 9600)\r\n");
 
-    /* ── Périphériques ────────────────────────────────────────────────────── */
     MX_SPI1_Init();
     MX_FATFS_Init();
     MX_DMA_Init();
     MX_TIM2_Init();
     MX_ADC1_Init();
 
+    /* SD CS encore une fois après init SPI */
+    SD_CS_HIGH();
+    HAL_Delay(10);
+
     ILI9341_Init();
     ILI9341_ClearScreen(ILI9341_BLACK);
 
+    /* SD CS après init LCD — le LCD a pu tripoter le bus SPI */
+    SD_CS_HIGH();
+
     AD8232_SLEEP();
-    HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
 
     LOG("En attente bouton...\r\n");
 
-    /*
-     * CORRECTION 4 : Démarrer le DMA une seule fois ici, avant la boucle principale.
-     * Il tourne en mode circulaire — pas besoin de le relancer entre acquisitions.
-     */
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, BUFFER_SIZE);
-
-    /* ═══ Boucle principale ════════════════════════════════════════════════ */
+    /* ═══ Boucle principale ══════════════════════════════════════════════ */
     while (1)
     {
-        /* Attente appui bouton (anti-rebond) */
         while (!BTN_PRESSED()) {}
         HAL_Delay(50);
         while ( BTN_PRESSED()) {}
         HAL_Delay(50);
 
-        LOG("\r\n--- Acquisition démarrée ---\r\n");
+        LOG("\r\n--- Acquisition demarree ---\r\n");
 
-        /* 1) Réveil AD8232 */
         AD8232_WAKE();
         HAL_Delay(5);
-
-        /* 2) Lecture GPS (avant montage SD pour ne pas bloquer l'ADC timer) */
         ILI9341_ClearScreen(ILI9341_BLACK);
+
+        /* CS SD bien haut après que le LCD a fini */
+        SD_CS_HIGH();
+        HAL_Delay(5);
+
+        /* ── 1. GPS ──────────────────────────────────────────────────── */
         gps_read_blocking();
 
-        /* 3) Init MA + reset compteurs */
-        ma_init(ADC_BASELINE);
-        sample_count      = 0;
-        pos               = 319;
-        last_x            = 120;
-        first_pt          = 1;
-        csv_pos           = 0;
-
-        /*
-         * CORRECTION 5 : reset explicite des flags DMA APRÈS la lecture GPS
-         * (la lecture GPS dure 3-5 s pendant lesquelles le DMA circulaire
-         *  a pu lever le flag plusieurs fois)
-         */
-        dma_complete_flag = 0;
-        dma_half_flag     = 0;
-
-        /* 4) Montage SD ───────────────────────────────────────────────────── */
+        /* ── 2. SD : montage + ouverture fichier ─────────────────────── */
         uint8_t file_open = 0;
 
-        f_mount(NULL, "", 0);               /* démontage propre */
-        HAL_Delay(50);
-        disk_initialize(0);
+        /* Séquence d'init SD propre */
+        f_mount(NULL, "", 0);
         HAL_Delay(20);
 
         FRESULT fm = f_mount(&fs, "", 1);
+
         if (fm == FR_NO_FILESYSTEM)
         {
             LOG("SD: formatage FAT32...\r\n");
             BYTE work[512];
-            f_mkfs("", FM_FAT32, 0, work, sizeof(work));
+            fm = f_mkfs("", FM_FAT32, 0, work, sizeof(work));
+            char fmsg[32];
+            snprintf(fmsg, sizeof(fmsg), "SD mkfs code=%d\r\n", (int)fm);
+            LOG(fmsg);
             fm = f_mount(&fs, "", 1);
         }
 
@@ -353,36 +342,58 @@ int main(void)
 
             if (f_open(&csv_file, fname, FA_CREATE_NEW | FA_WRITE) == FR_OK)
             {
-                const char *hdr = "index;raw;filtered;latitude;longitude\r\n";
-                if (f_write(&csv_file, hdr, strlen(hdr), &bw) == FR_OK && bw == strlen(hdr))
+                /*
+                 * Header ligne 1 : GPS (une seule fois pour tout le fichier)
+                 * Header ligne 2 : noms de colonnes
+                 */
+                char hdr[128];
+                int  hlen;
+                if (gps_valid)
+                    hlen = snprintf(hdr, sizeof(hdr),
+                                    "latitude;longitude\r\n"
+                                    "%.6f;%.6f\r\n"
+                                    "index;raw;filtered\r\n",
+                                    (double)gps_latitude,
+                                    (double)gps_longitude);
+                else
+                    hlen = snprintf(hdr, sizeof(hdr),
+                                    "latitude;longitude\r\n"
+                                    "0.000000;0.000000\r\n"
+                                    "index;raw;filtered\r\n");
+
+                if (f_write(&csv_file, hdr, (UINT)hlen, &bw) == FR_OK && bw == (UINT)hlen)
                 {
                     file_open = 1;
-                    LOG("SD OK: fichier ");
-                    LOG(fname);
-                    LOG("\r\n");
+                    LOG("SD OK: "); LOG(fname); LOG("\r\n");
                 }
-                else
-                {
-                    f_close(&csv_file);
-                    LOG("SD ERREUR write header\r\n");
-                }
+                else { f_close(&csv_file); LOG("SD ERR write hdr\r\n"); }
             }
-            else { LOG("SD ERREUR open\r\n"); }
+            else { LOG("SD ERR open\r\n"); }
         }
-        else { LOG("SD ERREUR mount\r\n"); }
+        else
+        {
+            char errmsg[32];
+            snprintf(errmsg, sizeof(errmsg), "SD ERR mount code=%d\r\n", (int)fm);
+            LOG(errmsg);
+        }
 
-        /* 5) Démarrage timer → ADC déclenché par TIM2_TRGO ──────────────── */
+        /* ── 3. Init MA + reset ───────────────────────────────────────── */
+        ma_init(ADC_BASELINE);
+        sample_count      = 0;
+        pos               = 319;
+        last_x            = 120;
+        first_pt          = 1;
+        csv_pos           = 0;
+        dma_complete_flag = 0;
+        dma_half_flag     = 0;
+
+        /* ── 4. Démarrage DMA → TIM2 ─────────────────────────────────── */
+        HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, BUFFER_SIZE);
         HAL_TIM_Base_Start(&htim2);
 
-        /* ─── Boucle d'acquisition ──────────────────────────────────────── */
+        /* ─── Boucle d'acquisition ───────────────────────────────────── */
         while (sample_count < TOTAL_SAMPLES)
         {
-            /*
-             * CORRECTION 6 : traiter à la fois le half-complete (premiers 10 éch.)
-             * et le full-complete (10 éch. suivants).
-             * Sans cela, avec DMA circulaire, on ne traitait qu'un demi-buffer
-             * sur deux → sample_count n'atteignait jamais TOTAL_SAMPLES.
-             */
             uint8_t process = 0;
             int     offset  = 0;
 
@@ -390,20 +401,20 @@ int main(void)
             {
                 dma_half_flag = 0;
                 process = 1;
-                offset  = 0;                /* premiers BUFFER_SIZE/2 échantillons */
+                offset  = 0;
             }
             else if (dma_complete_flag)
             {
                 dma_complete_flag = 0;
                 process = 1;
-                offset  = BUFFER_SIZE / 2;  /* seconds BUFFER_SIZE/2 échantillons */
+                offset  = BUFFER_SIZE / 2;
             }
 
             if (!process) continue;
 
             uint8_t leads_off =
-                (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_6) == GPIO_PIN_SET) ||  /* LO+ PC6 */
-                (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_5) == GPIO_PIN_SET);    /* LO- PC5 */
+                (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_6) == GPIO_PIN_SET) ||
+                (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_5) == GPIO_PIN_SET);
 
             for (int i = offset; i < offset + (BUFFER_SIZE / 2); i++)
             {
@@ -413,16 +424,16 @@ int main(void)
                 uint16_t filtered = ma_filter(raw);
                 if (leads_off) filtered = ADC_BASELINE;
 
-                if (file_open) csv_write_gps(sample_count, raw, filtered);
+                /* CSV : juste index;raw;filtered — GPS déjà dans le header */
+                if (file_open) csv_write_sample(sample_count, raw, filtered);
                 sample_count++;
 
-                /* Affichage oscilloscope scrollant */
-                int32_t  c     = (int32_t)filtered - ADC_BASELINE;
-                int16_t  cur_x = 120 - (int16_t)(c / GAIN);
+                /* Affichage oscilloscope */
+                int32_t c     = (int32_t)filtered - ADC_BASELINE;
+                int16_t cur_x = 120 - (int16_t)(c / GAIN);
                 if (cur_x <   5) cur_x =   5;
                 if (cur_x > 227) cur_x = 227;
 
-                /* Effacement de la zone d'avance */
                 for (uint8_t k = 1; k <= 5; k++) {
                     uint16_t ey = (uint16_t)((pos - k + 320) % 320);
                     ILI9341_DrawLineHorizontal(0, 227, ey, ILI9341_BLACK);
@@ -439,22 +450,18 @@ int main(void)
                 if (pos == 0) { pos = 319; first_pt = 1; } else pos--;
             }
         }
-        /* ─── Fin acquisition ──────────────────────────────────────────── */
 
+        /* ── 5. Fin acquisition ──────────────────────────────────────── */
         HAL_TIM_Base_Stop(&htim2);
-
-        /* NE PAS appeler HAL_ADC_Stop_DMA — le DMA reste actif pour la prochaine
-         * acquisition. On remet juste les flags à zéro.
-         * Si vous voulez vraiment l'arrêter, relancez-le APRES (voir bas de boucle).
-         */
+        HAL_ADC_Stop_DMA(&hadc1);
         dma_complete_flag = 0;
         dma_half_flag     = 0;
 
-        /* Fermeture fichier */
         if (file_open) {
             csv_flush();
             f_sync(&csv_file);
             f_close(&csv_file);
+            LOG("Fichier ferme OK\r\n");
         }
 
         {
@@ -465,18 +472,19 @@ int main(void)
         }
 
         AD8232_SLEEP();
+
+        /* CS SD haut avant de toucher au LCD */
+        SD_CS_HIGH();
         ILI9341_ClearScreen(ILI9341_BLACK);
+        SD_CS_HIGH();
+
         LOG("En attente bouton...\r\n");
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Callbacks DMA/ADC
- *
- *  CORRECTION 7 : HAL_ADC_ConvHalfCpltCallback AJOUTÉ.
- *  Sans lui, avec DMA circulaire + double-buffering, seul un transfert sur deux
- *  était signalé → sample_count stagnait et la boucle ne se terminait jamais.
- * ═══════════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════ */
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1) dma_half_flag = 1;
@@ -487,10 +495,9 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     if (hadc->Instance == ADC1) dma_complete_flag = 1;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Initialisations périphériques
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
+ * ═══════════════════════════════════════════════════════════════════════════ */
 static void MX_SPI1_Init(void)
 {
     hspi1.Instance               = SPI1;
@@ -500,7 +507,7 @@ static void MX_SPI1_Init(void)
     hspi1.Init.CLKPolarity       = SPI_POLARITY_LOW;
     hspi1.Init.CLKPhase          = SPI_PHASE_1EDGE;
     hspi1.Init.NSS               = SPI_NSS_SOFT;
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;  /* 80/8 = 10 MHz SD */
     hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
     hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
     hspi1.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
@@ -513,9 +520,9 @@ static void MX_TIM2_Init(void)
     TIM_MasterConfigTypeDef sMasterConfig = {0};
     __HAL_RCC_TIM2_CLK_ENABLE();
     htim2.Instance               = TIM2;
-    htim2.Init.Prescaler         = 79;           /* 80 MHz / 80 = 1 MHz */
+    htim2.Init.Prescaler         = 79;
     htim2.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim2.Init.Period            = 999;          /* 1 MHz / 1000 = 1 kHz → 1 ms */
+    htim2.Init.Period            = 999;
     htim2.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
     htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
     if (HAL_TIM_Base_Init(&htim2) != HAL_OK) Error_Handler();
@@ -549,7 +556,6 @@ static void MX_ADC1_Init(void)
     multimode.Mode = ADC_MODE_INDEPENDENT;
     HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode);
 
-    /* PC3 = ADC1_IN4 ✓ */
     sConfig.Channel      = ADC_CHANNEL_4;
     sConfig.Rank         = ADC_REGULAR_RANK_1;
     sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
@@ -566,15 +572,10 @@ static void MX_DMA_Init(void)
     HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 }
 
-/*
- * CORRECTION 8 : USART2 forcé à 115200 baud.
- * CubeMX avait généré 9600 → l'image CubeMX montre 9600 pour USART2,
- * ce qui causait l'absence totale d'affichage sur HTerm configuré à 115200.
- */
 static void MX_USART2_UART_Init(void)
 {
     huart2.Instance          = USART2;
-    huart2.Init.BaudRate     = 9600;
+    huart2.Init.BaudRate     = 115200;   /* ← 115200, pas 9600 */
     huart2.Init.WordLength   = UART_WORDLENGTH_8B;
     huart2.Init.StopBits     = UART_STOPBITS_1;
     huart2.Init.Parity       = UART_PARITY_NONE;
@@ -606,61 +607,58 @@ static void MX_GPIO_Init(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* SD CS = HIGH (inactif) */
-    HAL_GPIO_WritePin(SD_CS_GPIO_Port,  SD_CS_Pin, GPIO_PIN_SET);
-    /* LCD + SDN = LOW */
-    HAL_GPIO_WritePin(GPIOC, LCD_RST_Pin | LCD_D1_Pin | SDN_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, LCD_RD_Pin | LCD_WR_Pin | LCD_RS_Pin | LCD_D7_Pin | LCD_D0_Pin | LCD_D2_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, LCD_CS_Pin | LCD_D6_Pin | LCD_D3_Pin | LCD_D5_Pin | LCD_D4_Pin, GPIO_PIN_RESET);
+    /* SD CS HIGH en premier — avant tout init SPI */
+    HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
 
-    /* LCD sorties + SDN */
+    HAL_GPIO_WritePin(GPIOC, LCD_RST_Pin | LCD_D1_Pin | SDN_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LCD_RD_Pin | LCD_WR_Pin | LCD_RS_Pin |
+                             LCD_D7_Pin | LCD_D0_Pin | LCD_D2_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, LCD_CS_Pin | LCD_D6_Pin | LCD_D3_Pin |
+                             LCD_D5_Pin | LCD_D4_Pin, GPIO_PIN_RESET);
+
     GPIO_InitStruct.Pin   = LCD_RST_Pin | LCD_D1_Pin | SDN_Pin;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull  = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* PC3 analogique ADC */
     GPIO_InitStruct.Pin  = Analog_input_PC3_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(Analog_input_PC3_GPIO_Port, &GPIO_InitStruct);
 
-    /* LCD GPIOA */
-    GPIO_InitStruct.Pin   = LCD_RD_Pin | LCD_WR_Pin | LCD_RS_Pin | LCD_D7_Pin | LCD_D0_Pin | LCD_D2_Pin;
+    GPIO_InitStruct.Pin   = LCD_RD_Pin | LCD_WR_Pin | LCD_RS_Pin |
+                            LCD_D7_Pin | LCD_D0_Pin | LCD_D2_Pin;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull  = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* LCD GPIOB */
-    GPIO_InitStruct.Pin   = LCD_CS_Pin | LCD_D6_Pin | LCD_D3_Pin | LCD_D5_Pin | LCD_D4_Pin;
+    GPIO_InitStruct.Pin   = LCD_CS_Pin | LCD_D6_Pin | LCD_D3_Pin |
+                            LCD_D5_Pin | LCD_D4_Pin;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull  = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    /*
-     * CORRECTION 9 : PC5 (LO-) et PC6 (LO+) — entrées avec pull-down.
-     * Le AD8232 met ces pins à HIGH quand les électrodes sont déconnectées.
-     */
     GPIO_InitStruct.Pin  = GPIO_PIN_5 | GPIO_PIN_6;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* Bouton PA11 pull-up actif bas */
     GPIO_InitStruct.Pin  = Pousoir_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(Pousoir_GPIO_Port, &GPIO_InitStruct);
 
-    /* SD CS */
     GPIO_InitStruct.Pin   = SD_CS_Pin;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull  = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(SD_CS_GPIO_Port, &GPIO_InitStruct);
+
+    /* Remettre SD CS HIGH après init GPIO (init remet à 0) */
+    HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
 }
 
 void SystemClock_Config(void)
@@ -682,7 +680,7 @@ void SystemClock_Config(void)
     RCC_OscInitStruct.PLL.PLLR            = RCC_PLLR_DIV2;
     if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
 
-    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK  | RCC_CLOCKTYPE_SYSCLK |
                                        RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
     RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
     RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
