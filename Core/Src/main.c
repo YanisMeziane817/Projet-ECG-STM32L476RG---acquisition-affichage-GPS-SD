@@ -36,7 +36,7 @@ UART_HandleTypeDef huart3;
 #define ADC_BASELINE   2000
 #define GAIN           5
 #define TOTAL_SAMPLES  500u
-#define MA_SIZE        4
+#define MA_SIZE        1
 #define CSV_BUF_SIZE   512
 #define GPS_LINE_SIZE  128
 
